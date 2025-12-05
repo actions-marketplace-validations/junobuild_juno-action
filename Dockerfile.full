@@ -1,0 +1,111 @@
+# --- Build Stage ---
+FROM node:24-slim@sha256:76d0ed0ed93bed4f4376211e9d8fddac4d8b3fbdb54cc45955696001a3c91152 AS builder
+
+LABEL stage=builder
+
+# Install required tools
+RUN DEBIAN_FRONTEND=noninteractive apt update && apt install -y \
+    bash \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a working user
+RUN useradd -ms /bin/bash apprunner
+
+# Define working directories
+RUN mkdir -p /juno && chown apprunner:apprunner /juno
+
+# Use a user instead of using root
+USER apprunner
+
+# Environment variables where files are downloaded and executed
+ENV TARGET_DIR=/juno/target
+RUN echo "export TARGET_DIR=${TARGET_DIR}" >> /home/apprunner/.bashrc
+
+# Environment variables for using the Juno source repo
+ENV JUNO_MAIN_DIR=${TARGET_DIR}/juno-main
+RUN echo "export JUNO_MAIN_DIR=${JUNO_MAIN_DIR}" >> /home/apprunner/.bashrc
+
+# Copy list of resources to download
+COPY --chown=apprunner:apprunner ./docker/download ./docker/download
+
+# Download required artifacts and sources
+RUN ./docker/download/init
+
+# Install Rust and Cargo in apprunner home
+ENV RUSTUP_HOME=/home/apprunner/.rustup \
+    CARGO_HOME=/home/apprunner/.cargo \
+    PATH=/home/apprunner/.cargo/bin:$PATH
+
+# Copy list of scripts to run setup
+COPY --chown=apprunner:apprunner ./kit/setup/bootstrap ./kit/setup/bootstrap
+
+# Install core tools required for building WASM (same as in the main Juno repository)
+RUN ./kit/setup/bootstrap
+
+# --- Runtime Stage ---
+FROM node:24-slim@sha256:76d0ed0ed93bed4f4376211e9d8fddac4d8b3fbdb54cc45955696001a3c91152
+
+LABEL repository="https://github.com/junobuild/juno-action"
+LABEL homepage="https://juno.build"
+LABEL maintainer="David Dal Busco <david.dalbusco@outlook.com>"
+
+LABEL com.github.actions.name="GitHub Action for Juno"
+LABEL com.github.actions.description="Enable arbitrary actions with the Juno CLI."
+LABEL com.github.actions.icon="package"
+LABEL com.github.actions.color="purple"
+
+ENV TZ=UTC
+
+# Install required tools
+RUN DEBIAN_FRONTEND=noninteractive apt update && apt install -y \
+    build-essential \
+    curl \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# Install Pnpm and Juno's CLI
+COPY ./kit/setup/tools ./kit/setup/tools
+RUN ./kit/setup/tools
+
+# Install extra WASM build tools - e.g. for Sputnik - required by the GitHub Action runtime
+COPY ./kit/setup/addons ./kit/setup/addons
+RUN ./kit/setup/addons
+
+# Create and use a user instead of using root
+RUN useradd -ms /bin/bash apprunner
+USER apprunner
+
+# Copy Cargo binaries
+COPY --from=builder --chown=apprunner:apprunner /home/apprunner/.cargo/bin /home/apprunner/.cargo/bin
+
+# Copy Rust toolchain (includes rustc)
+COPY --from=builder --chown=apprunner:apprunner /home/apprunner/.rustup /home/apprunner/.rustup
+
+# Define paths
+ENV CARGO_HOME=/home/apprunner/.cargo \
+    RUSTUP_HOME=/home/apprunner/.rustup \
+    PATH=/home/apprunner/.cargo/bin:$PATH
+
+# Copy Juno main repo sources and configuration for building serverless functions in TS/JS
+COPY --from=builder --chown=apprunner:apprunner /juno/target/juno-main/src /juno/src
+COPY --from=builder --chown=apprunner:apprunner /juno/target/juno-main/Cargo.lock /juno/Cargo.lock
+COPY --from=builder --chown=apprunner:apprunner /juno/target/juno-main/Cargo.toml /juno/Cargo.toml
+COPY --from=builder --chown=apprunner:apprunner /juno/target/juno-main/rust-toolchain.toml /juno/rust-toolchain.toml
+
+# Resolves cargo build error:
+# network failure seems to have happened
+# if a proxy or similar is necessary `net.git-fetch-with-cli` may help here
+# https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+RUN mkdir -p /home/apprunner/.cargo && \
+    echo '[net]\ngit-fetch-with-cli = true' > /home/apprunner/.cargo/config.toml
+
+# Copy docs and entrypoint
+COPY --chown=apprunner:apprunner LICENSE README.md /
+COPY --chown=apprunner:apprunner "entrypoint.sh" "/entrypoint.sh"
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--help"]
